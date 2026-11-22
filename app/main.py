@@ -21,6 +21,7 @@ from .db import (
 from .hll import Summary, SummaryError, decode_summary_base64
 from .schemas import (
     ActivePartitionsResponse,
+    BlockCacheResponse,
     ErrorResponse,
     HealthResponse,
     ReachResponse,
@@ -44,6 +45,15 @@ Superseded snapshots are marked invalid and later queries recompute.
 same precision and encoding version, reads the result from one committed
 snapshot, and returns the estimate, its theoretical 95% error bound, and the
 exact partitions (day, revision, revision id) it adopted.
+
+**Block cache.** The UTC calendar is divided into fixed, contiguous blocks
+(`REACH_BLOCK_DAYS`, default 7) anchored at 1970-01-01. Merged registers for
+each fully covered block are cached durably in SQLite together with the exact
+revision ids they merged, so overlapping ranges reuse whole blocks and only
+merge a few boundary days. A backfill invalidates precisely the blocks that
+contain a replaced day; every other block stays valid. The cache is shared by
+all API instances using the same database and survives restarts. Inspect it
+at `GET /v1/blocks`.
 
 **Rejected** with a structured error: corrupt or truncated summaries, a
 header precision that differs from the batch precision, incompatible
@@ -301,3 +311,13 @@ def get_snapshot(snapshot_id: int, db: Database = Depends(get_db)) -> dict[str, 
 )
 def list_partitions(db: Database = Depends(get_db)) -> dict[str, Any]:
     return {"partitions": db.active_partitions()}
+
+
+@app.get(
+    "/v1/blocks",
+    tags=["inspect"],
+    response_model=BlockCacheResponse,
+    summary="Inspect the durable fixed-block merge cache",
+)
+def list_blocks(db: Database = Depends(get_db)) -> dict[str, Any]:
+    return {"block_days": db.block_days, "blocks": db.blocks()}

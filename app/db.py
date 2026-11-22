@@ -17,6 +17,18 @@ Design notes
 * A late revision marks every snapshot that adopted one of its days as
   invalidated.  Cached answers for invalidated snapshots are no longer
   reused, but remain inspectable through ``GET /v1/snapshots/{id}``.
+* Long ranges are accelerated by a block cache (``register_blocks``).  The
+  UTC calendar is divided into fixed, contiguous blocks of
+  ``REACH_BLOCK_DAYS`` days anchored at 1970-01-01; each cached block stores
+  the register-wise merge of the active partitions for every one of its
+  days plus the exact revision ids that were merged.  A query reuses every
+  fully covered block whose revision ids still match the committed state
+  and merges only the few boundary days itself.  A backfill invalidates
+  exactly the blocks containing a replaced day, so all other blocks stay
+  usable by every process sharing this database.  Block rows are plain
+  durable data: after a restart the cache is rebuilt lazily from the same
+  table, and the user-visible estimate, error bound and snapshot format are
+  unchanged.
 * Writers use ``BEGIN IMMEDIATE`` under a process lock; SQLite's single
   writer plus a busy timeout serializes uploads across processes, while WAL
   lets readers proceed concurrently.
@@ -121,6 +133,24 @@ CREATE TABLE IF NOT EXISTS query_results (
 CREATE INDEX IF NOT EXISTS idx_query_results_range
     ON query_results (start_date, end_date, snapshot_id DESC);
 
+-- Merged registers for one fixed, contiguous block of UTC days.  Blocks live
+-- on a deterministic grid (see block_index_for_day), so overlapping ranges
+-- merge the same blocks and backfills only invalidate the blocks that contain
+-- a replaced day.  A row is reusable only while ``invalidated_at`` is NULL and
+-- ``member_revision_ids`` matches the active revision id of every block day;
+-- the revision-id check is the cross-process guard against stale merges.
+CREATE TABLE IF NOT EXISTS register_blocks (
+    block_index            INTEGER PRIMARY KEY,
+    start_date             TEXT    NOT NULL,
+    end_date               TEXT    NOT NULL,
+    member_revision_ids    TEXT    NOT NULL,
+    registers              BLOB    NOT NULL,
+    registers_checksum     INTEGER NOT NULL,
+    created_at             TEXT    NOT NULL,
+    invalidated_at         TEXT,
+    invalidation_reason    TEXT
+);
+
 -- The deployment-wide precision and encoding version.  The first accepted
 -- revision pins them; every later upload must match so all partitions in the
 -- store are always mergeable.
@@ -134,6 +164,34 @@ CREATE TABLE IF NOT EXISTS service_config (
 
 UTC = timezone.utc
 MAX_RANGE_DAYS = 366 * 5
+
+# Fixed grid for cached merge blocks: block 0 starts at the Unix epoch and
+# every block holds BLOCK_DAYS contiguous UTC days.  The anchor never moves,
+# so the same dates always map to the same blocks in every process.
+BLOCK_EPOCH = date(1970, 1, 1)
+DEFAULT_BLOCK_DAYS = 7
+
+
+def configured_block_days() -> int:
+    """Read the block size (days) from ``REACH_BLOCK_DAYS``.
+
+    All processes sharing one database must use the same value; the default
+    of 7 keeps a query's boundary work at <= 12 day merges.  The value is
+    validated at startup so a typo fails fast instead of corrupting the grid.
+    """
+
+    raw = os.environ.get("REACH_BLOCK_DAYS", str(DEFAULT_BLOCK_DAYS))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"REACH_BLOCK_DAYS must be an integer between 2 and 366, got {raw!r}"
+        ) from exc
+    if not 2 <= value <= 366:
+        raise ValueError(
+            f"REACH_BLOCK_DAYS must be an integer between 2 and 366, got {value}"
+        )
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -273,12 +331,61 @@ def payload_digest(
 
 
 class Database:
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(self, path: str | os.PathLike[str], block_days: int | None = None) -> None:
         self.path = str(path)
+        self.block_days = (
+            configured_block_days() if block_days is None else int(block_days)
+        )
+        if not 2 <= self.block_days <= 366:
+            raise ValueError("block_days must be between 2 and 366")
         self._write_lock = threading.Lock()
         if self.path != ":memory:":
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    # -- block grid ------------------------------------------------------
+
+    def block_index_for_day(self, day: date) -> int:
+        """Return the fixed-grid block index that contains ``day``."""
+
+        return (day - BLOCK_EPOCH).days // self.block_days
+
+    def block_span(self, block_index: int) -> tuple[date, date]:
+        """Return the inclusive (start, end) UTC dates of one grid block."""
+
+        start = BLOCK_EPOCH + timedelta(days=block_index * self.block_days)
+        return start, start + timedelta(days=self.block_days - 1)
+
+    def split_block_coverage(
+        self, days: Sequence[date]
+    ) -> tuple[list[int], list[date]]:
+        """Split ordered ``days`` into fully covered blocks and boundary days.
+
+        A block counts as fully covered only when *all* of its grid days are
+        present in ``days``; partial blocks at either end of the range stay as
+        individual boundary days and are merged directly.  Returns
+        ``(block_indices, boundary_days)`` in ascending date order.
+        """
+
+        if not days:
+            return [], []
+        present = set(days)
+        full_blocks: list[int] = []
+        covered_days: set[date] = set()
+        index = self.block_index_for_day(days[0])
+        last_index = self.block_index_for_day(days[-1])
+        while index <= last_index:
+            start, end = self.block_span(index)
+            members = [
+                start + timedelta(days=offset)
+                for offset in range((end - start).days + 1)
+            ]
+            if all(day in present for day in members):
+                full_blocks.append(index)
+                covered_days.update(members)
+            index += 1
+        boundary = [day for day in days if day not in covered_days]
+        return full_blocks, boundary
 
     # -- connections -----------------------------------------------------
 
@@ -323,8 +430,23 @@ class Database:
         connection = self._connect()
         try:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
         finally:
             connection.close()
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        """Apply small additive upgrades on databases created by older code."""
+
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(register_blocks)")
+        }
+        if columns and "registers_checksum" not in columns:
+            # Rows written before the checksum existed get NULL and are
+            # rebuilt on the next query instead of being trusted blindly.
+            connection.execute(
+                "ALTER TABLE register_blocks ADD COLUMN registers_checksum INTEGER"
+            )
     # -- ingest ----------------------------------------------------------
 
     def submit_revision(
@@ -371,6 +493,7 @@ class Database:
                     "accepted_partitions": [],
                     "superseded_revisions": [],
                     "invalidated_snapshots": [],
+                    "invalidated_blocks": [],
                 }
 
             # Validate ordering for every day before writing anything so a
@@ -510,6 +633,14 @@ class Database:
                 ),
                 now=now,
             )
+            invalidated_blocks = self._invalidate_blocks(
+                connection,
+                days=changed_days,
+                reason=(
+                    f"revision {revision} replaced {len(changed_days)} partition(s)"
+                ),
+                now=now,
+            )
 
         return {
             "status": "unchanged" if not changed_days else "accepted",
@@ -520,6 +651,7 @@ class Database:
             "accepted_partitions": accepted,
             "superseded_revisions": superseded,
             "invalidated_snapshots": invalidated,
+            "invalidated_blocks": invalidated_blocks,
         }
 
     def _insert_partition_revision(
@@ -591,6 +723,43 @@ class Database:
             [now, reason, *snapshot_ids],
         )
         return snapshot_ids
+
+    def _invalidate_blocks(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        days: Sequence[date],
+        reason: str,
+        now: str,
+    ) -> list[int]:
+        """Invalidate exactly the grid blocks that contain a replaced day.
+
+        Blocks not overlapping any changed day keep their merged registers and
+        stay reusable.  Already-invalid blocks are not reported again.  The
+        update runs in the same transaction as the partition replacement, so a
+        block can never be considered valid for a committed state whose days
+        it no longer matches.
+        """
+
+        if not days:
+            return []
+        block_indices = sorted({self.block_index_for_day(day) for day in days})
+        placeholders = ",".join("?" for _ in block_indices)
+        rows = connection.execute(
+            "SELECT block_index FROM register_blocks "
+            f"WHERE block_index IN ({placeholders}) AND invalidated_at IS NULL",
+            block_indices,
+        ).fetchall()
+        stale_indices = [int(row["block_index"]) for row in rows]
+        if not stale_indices:
+            return []
+        stale_placeholders = ",".join("?" for _ in stale_indices)
+        connection.execute(
+            "UPDATE register_blocks SET invalidated_at = ?, invalidation_reason = ? "
+            f"WHERE block_index IN ({stale_placeholders})",
+            [now, reason, *stale_indices],
+        )
+        return stale_indices
 
     # -- query -----------------------------------------------------------
 
@@ -688,24 +857,50 @@ class Database:
         end: date,
         pinned: Sequence[tuple[Any, ...]],
     ) -> dict[str, Any]:
-        # Validate and merge before touching the snapshot tables.  A
-        # revision's registers are immutable, so validation against the
-        # pinned bytes is enough; no concurrent writer can invalidate them.
+        # Merge before touching the snapshot tables.  A revision's registers
+        # are immutable, so validation against the pinned bytes is enough; no
+        # concurrent writer can invalidate them.  Boundary-day partitions are
+        # validated directly; block-covered days are validated when their
+        # block is rebuilt (or covered by the cached block's checksum).
         precision = pinned[0][3]
         version = pinned[0][4]
-        for (
-            _day,
-            _revision,
-            revision_id,
-            part_precision,
-            part_version,
-            registers,
-            checksum,
-        ) in pinned:
+        pinned_by_day = {
+            date.fromisoformat(item[0]): item for item in pinned
+        }
+        ordered_days = [date.fromisoformat(item[0]) for item in pinned]
+        full_blocks, boundary_days = self.split_block_coverage(ordered_days)
+        block_registers = self._block_registers(
+            connection,
+            block_indices=full_blocks,
+            pinned_by_day=pinned_by_day,
+            precision=precision,
+        )
+        # Boundary partitions are merged directly, so their stored bytes are
+        # re-validated against bit rot exactly as before.  Block-covered days
+        # are already represented by a checksum-verified cached block; when a
+        # block is rebuilt its member bytes are validated in _block_registers.
+        for day in boundary_days:
+            (
+                _d,
+                _revision,
+                revision_id,
+                part_precision,
+                part_version,
+                registers,
+                checksum,
+            ) = pinned_by_day[day]
             self._validate_persisted(
                 revision_id, part_precision, part_version, registers, checksum
             )
-        merged = merge_register_bytes((item[5] for item in pinned), precision)
+        boundary_registers = [
+            bytes(pinned_by_day[day][5]) for day in boundary_days
+        ]
+        merged_parts = boundary_registers + block_registers
+        merged = (
+            merged_parts[0]
+            if len(merged_parts) == 1
+            else merge_register_bytes(merged_parts, precision)
+        )
         value = estimate_registers(merged)
         bounds = error_bound(value, precision)
 
@@ -719,6 +914,7 @@ class Database:
         )
 
         partitions: list[dict[str, Any]] = []
+        snapshot_rows: list[tuple[Any, ...]] = []
         for (
             day,
             revision,
@@ -728,11 +924,7 @@ class Database:
             registers,
             _checksum,
         ) in pinned:
-            connection.execute(
-                "INSERT INTO snapshot_partitions "
-                "(snapshot_id, partition_date, revision, revision_id, "
-                " precision, encoding_version, registers) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            snapshot_rows.append(
                 (
                     snapshot_id,
                     day,
@@ -741,7 +933,7 @@ class Database:
                     part_precision,
                     part_version,
                     registers,
-                ),
+                )
             )
             partitions.append(
                 {
@@ -751,6 +943,13 @@ class Database:
                     "precision": part_precision,
                 }
             )
+        connection.executemany(
+            "INSERT INTO snapshot_partitions "
+            "(snapshot_id, partition_date, revision, revision_id, "
+            " precision, encoding_version, registers) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            snapshot_rows,
+        )
 
         response = {
             "snapshot_id": snapshot_id,
@@ -781,6 +980,116 @@ class Database:
             ),
         )
         return response
+
+    def _block_registers(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        block_indices: Sequence[int],
+        pinned_by_day: dict[date, tuple[Any, ...]],
+        precision: int,
+    ) -> list[bytes]:
+        """Return merged registers for each full block, reusing cached rows.
+
+        A cached block is adopted only when it is still valid and its stored
+        member revision ids equal the revision ids this query pinned for every
+        block day.  Anything else -- missing row, invalidation, bit rot, or a
+        racing backfill -- is rebuilt from the pinned bytes and upserted.  The
+        whole check runs inside the query's ``BEGIN IMMEDIATE`` transaction, so
+        no writer can change the active partitions between the check and the
+        publish; a merge started against an older revision can never be
+        published as a valid block for the newer state.
+        """
+
+        expected_length = register_count(precision)
+        result: list[bytes] = []
+        if not block_indices:
+            return result
+
+        # One read for every block in the range instead of one round trip each.
+        placeholders = ",".join("?" for _ in block_indices)
+        cached_rows = {
+            int(row["block_index"]): row
+            for row in connection.execute(
+                "SELECT block_index, member_revision_ids, registers, "
+                "       registers_checksum, invalidated_at "
+                f"FROM register_blocks WHERE block_index IN ({placeholders})",
+                list(block_indices),
+            ).fetchall()
+        }
+
+        for block_index in block_indices:
+            block_start, block_end = self.block_span(block_index)
+            member_days = [
+                block_start + timedelta(days=offset)
+                for offset in range((block_end - block_start).days + 1)
+            ]
+            expected_revision_ids = [
+                int(pinned_by_day[day][2]) for day in member_days
+            ]
+            expected_signature = json.dumps(expected_revision_ids)
+
+            row = cached_rows.get(block_index)
+            cached_registers = bytes(row["registers"]) if row is not None else b""
+            reusable = (
+                row is not None
+                and row["invalidated_at"] is None
+                and row["member_revision_ids"] == expected_signature
+                and len(cached_registers) == expected_length
+                and row["registers_checksum"] is not None
+                and (binascii.crc32(cached_registers) & 0xFFFFFFFF)
+                == int(row["registers_checksum"])
+            )
+            if reusable:
+                result.append(cached_registers)
+                continue
+
+            # Rebuilding from pinned day partitions: validate every member's
+            # stored bytes first so bit rot cannot enter a cached block.
+            for day in member_days:
+                (
+                    _d,
+                    _revision,
+                    revision_id,
+                    part_precision,
+                    part_version,
+                    registers,
+                    checksum,
+                ) = pinned_by_day[day]
+                self._validate_persisted(
+                    revision_id, part_precision, part_version, registers, checksum
+                )
+            merged = merge_register_bytes(
+                (pinned_by_day[day][5] for day in member_days), precision
+            )
+            now = utc_now_iso()
+            connection.execute(
+                "INSERT INTO register_blocks "
+                "(block_index, start_date, end_date, member_revision_ids, "
+                " registers, registers_checksum, created_at, "
+                " invalidated_at, invalidation_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL) "
+                "ON CONFLICT(block_index) DO UPDATE SET "
+                "start_date = excluded.start_date, "
+                "end_date = excluded.end_date, "
+                "member_revision_ids = excluded.member_revision_ids, "
+                "registers = excluded.registers, "
+                "registers_checksum = excluded.registers_checksum, "
+                "created_at = excluded.created_at, "
+                "invalidated_at = NULL, "
+                "invalidation_reason = NULL",
+                (
+                    block_index,
+                    block_start.isoformat(),
+                    block_end.isoformat(),
+                    expected_signature,
+                    merged,
+                    binascii.crc32(merged) & 0xFFFFFFFF,
+                    now,
+                ),
+            )
+            result.append(merged)
+        return result
 
     @staticmethod
     def _validate_persisted(
@@ -864,6 +1173,30 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def blocks(self) -> list[dict[str, Any]]:
+        """Inspect the durable block cache (used by ``GET /v1/blocks``)."""
+
+        with self.read() as connection:
+            rows = connection.execute(
+                "SELECT block_index, start_date, end_date, member_revision_ids, "
+                "       created_at, invalidated_at, invalidation_reason "
+                "FROM register_blocks ORDER BY block_index"
+            ).fetchall()
+            return [
+                {
+                    "block_index": int(row["block_index"]),
+                    "start_date": row["start_date"],
+                    "end_date": row["end_date"],
+                    "block_days": self.block_days,
+                    "member_revision_ids": json.loads(row["member_revision_ids"]),
+                    "created_at": row["created_at"],
+                    "still_valid": row["invalidated_at"] is None,
+                    "invalidated_at": row["invalidated_at"],
+                    "invalidation_reason": row["invalidation_reason"],
+                }
+                for row in rows
+            ]
+
     def health(self) -> dict[str, Any]:
         start_time = time.perf_counter()
         with self.read() as connection:
@@ -874,9 +1207,17 @@ class Database:
             snapshots = connection.execute(
                 "SELECT COUNT(*) AS n FROM snapshots"
             ).fetchone()["n"]
+            block_row = connection.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN invalidated_at IS NULL THEN 1 ELSE 0 END) AS valid "
+                "FROM register_blocks"
+            ).fetchone()
         return {
             "database": "ok",
             "active_partitions": active,
             "snapshots": snapshots,
+            "cached_blocks": int(block_row["total"] or 0),
+            "valid_blocks": int(block_row["valid"] or 0),
+            "block_days": self.block_days,
             "latency_ms": round((time.perf_counter() - start_time) * 1000, 3),
         }

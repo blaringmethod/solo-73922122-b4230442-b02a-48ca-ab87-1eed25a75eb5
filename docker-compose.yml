@@ -1,24 +1,46 @@
+# Two API instances sharing one SQLite database on a named volume.
+#
+#   docker compose up --build
+#     instance 1:  http://localhost:8000  (docs at /docs)
+#     instance 2:  http://localhost:8001  (docs at /docs)
+#
+# Both containers mount the same reach-data volume at /data, so the block
+# cache (register_blocks table) is shared and durable: a backfill accepted by
+# one instance invalidates blocks the other instance reads, and a restart
+# rebuilds nothing -- the cached blocks are read straight back from SQLite.
+
+x-api: &api
+  build: .
+  image: reach-dedup:local
+  environment:
+    REACH_DB_PATH: /data/reach.sqlite3
+    # Fixed grid block size in UTC days. Both instances must use the same
+    # value; the default is 7 (boundary work per query stays below 12 days).
+    REACH_BLOCK_DAYS: "7"
+  volumes:
+    - reach-data:/data
+  restart: unless-stopped
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 5s
+
 services:
-  api:
-    build: .
-    image: reach-dedup:local
+  api-1:
+    <<: *api
     ports:
       - "8000:8000"
-    environment:
-      REACH_DB_PATH: /data/reach.sqlite3
-    volumes:
-      - reach-data:/data
-    restart: unless-stopped
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+
+  api-2:
+    <<: *api
+    ports:
+      - "8001:8000"
 
 volumes:
   reach-data:

@@ -129,6 +129,13 @@ class UploadRevisionResponse(BaseModel):
     accepted_partitions: list[AcceptedPartition] = Field(default_factory=list)
     superseded_revisions: list[SupersededPartition] = Field(default_factory=list)
     invalidated_snapshots: list[int] = Field(default_factory=list)
+    invalidated_blocks: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Fixed-grid merge blocks invalidated because they contain a replaced "
+            "UTC day; other cached blocks remain reusable."
+        ),
+    )
     message: str | None = None
 
 
@@ -200,9 +207,33 @@ class ActivePartitionsResponse(BaseModel):
     partitions: list[ActivePartition]
 
 
+class BlockCacheEntry(BaseModel):
+    block_index: int = Field(description="Fixed-grid block number (days since 1970-01-01 / block_days).")
+    start_date: date
+    end_date: date
+    block_days: int = Field(description="Configured fixed block size in UTC days.")
+    member_revision_ids: list[int] = Field(
+        description="Revision id merged per block day, in date order."
+    )
+    created_at: str
+    still_valid: bool = Field(
+        description="False once a backfill replaced a day covered by this block."
+    )
+    invalidated_at: str | None = None
+    invalidation_reason: str | None = None
+
+
+class BlockCacheResponse(BaseModel):
+    block_days: int
+    blocks: list[BlockCacheEntry]
+
+
 class HealthResponse(BaseModel):
     status: str
     database: str
     active_partitions: int
     snapshots: int
+    cached_blocks: int
+    valid_blocks: int
+    block_days: int
     latency_ms: float

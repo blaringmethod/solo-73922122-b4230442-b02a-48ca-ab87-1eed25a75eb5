@@ -400,6 +400,8 @@ def test_openapi_documents_endpoints_and_error_envelopes(client):
     assert "/v1/reach" in spec["paths"]
     assert "/v1/snapshots/{snapshot_id}" in spec["paths"]
     assert "/v1/partitions" in spec["paths"]
+    assert "/v1/blocks" in spec["paths"]
+    assert "get" in spec["paths"]["/v1/blocks"]
     assert "post" in spec["paths"]["/v1/revisions"]
     assert spec["info"]["title"] == "Reach Deduplication Estimator"
     assert client.get("/docs").status_code == 200
@@ -409,5 +411,9 @@ def test_health_endpoints(client):
     assert client.get("/healthz").json() == {"status": "ok"}
     ready = client.get("/readyz")
     assert ready.status_code == 200
-    assert ready.json()["database"] == "ok"
-    assert ready.json()["active_partitions"] == 0
+    body = ready.json()
+    assert body["database"] == "ok"
+    assert body["active_partitions"] == 0
+    assert body["cached_blocks"] == 0
+    assert body["valid_blocks"] == 0
+    assert body["block_days"] >= 2
